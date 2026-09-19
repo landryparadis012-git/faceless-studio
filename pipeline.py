@@ -7,8 +7,8 @@ EPS = ROOT / "episodes"
 VOICE = "en-US-ChristopherNeural"
 GEMINI = ("https://generativelanguage.googleapis.com/v1beta/"
           "models/gemini-2.0-flash:generateContent")
-IMG_URL = ("https://image.pollinations.ai/prompt/{p}"
-           "?width=720&height=1280&seed={seed}&model=flux&nologo=true")
+IMG_URL = ("https://generativelanguage.googleapis.com/v1beta/"
+          "models/gemini-flash-latest:generateContent")
 FPS = 30
 FONT = os.environ.get("FONT", "DejaVuSans")
 

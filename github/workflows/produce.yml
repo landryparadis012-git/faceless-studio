@@ -1,0 +1,27 @@
+name: produce
+on:
+  workflow_dispatch:
+    inputs: {topic: {description: "optional topic override", required: false}}
+  schedule: [{cron: "0 9 * * *"}]
+concurrency: {group: produce, cancel-in-progress: false}
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -r requirements.txt
+      - run: |
+          EP="EP-$(date +%Y%m%d-%H%M)"
+          python pipeline.py write   --episode "$EP" --topic "${{ github.event.inputs.topic }}"
+          python pipeline.py produce --episode "$EP"
+          python pipeline.py notify  --episode "$EP"
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: episodes, path: "episodes/*/[!s]*", retention-days: 3}

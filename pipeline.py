@@ -12,7 +12,7 @@ FONT = os.environ.get("FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.
 IMG_URL = ("https://image.pollinations.ai/prompt/{p}"
            "?width=720&height=1280&seed={seed}&model=flux&nologo=true")
 GROQ = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"]
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
 TOPICS = [
     "a poor village boy who becomes king",

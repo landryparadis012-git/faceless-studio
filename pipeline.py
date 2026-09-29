@@ -1,4 +1,4 @@
-"""Faceless 'Life at Every Level' pipeline. LLM: Groq primary, Gemini backup."""
+"""Faceless 'Life at Every Level' pipeline. LLM: Groq primary (curl fallback), Gemini backup."""
 import argparse, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 import requests
@@ -12,6 +12,7 @@ FONT = os.environ.get("FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.
 IMG_URL = ("https://image.pollinations.ai/prompt/{p}"
            "?width=720&height=1280&seed={seed}&model=flux&nologo=true")
 GROQ = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_UA = "faceless-studio/1.0"
 GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
 TOPICS = [
@@ -73,10 +74,30 @@ def _extract_json(txt):
         raise ValueError(f"no JSON object found in: {txt[:200]}")
     return json.loads(txt[i:j + 1])
 
+def _groq_call_curl(model, prompt, key):
+    payload = json.dumps({"model": model,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "response_format": {"type": "json_object"},
+                          "temperature": 1.0})
+    p = subprocess.run(["curl", "-s", "-w", "\n%{http_code}", "--max-time", "120",
+                        "-X", "POST", GROQ,
+                        "-H", f"Authorization: Bearer {key}",
+                        "-H", "Content-Type: application/json",
+                        "-d", payload],
+                       capture_output=True, text=True, timeout=150)
+    if p.returncode != 0:
+        raise RuntimeError(f"curl transport error: {p.stderr[:150]}")
+    body, _, code = p.stdout.rpartition("\n")
+    if code.strip() != "200":
+        raise RuntimeError(f"curl HTTP {code.strip()}: {body[:150]}")
+    out = json.loads(body)
+    return _extract_json(out["choices"][0]["message"]["content"])
+
 def groq_json(prompt):
     key = os.environ["GROQ_API_KEY"]
     last = None
     for model in GROQ_MODELS:
+        blocked = False
         for attempt in range(1, 4):
             try:
                 print(f"[groq] trying {model} (attempt {attempt}/3)")
@@ -87,7 +108,8 @@ def groq_json(prompt):
                 req = urllib.request.Request(
                     GROQ, data=json.dumps(body).encode(),
                     headers={"Content-Type": "application/json",
-                             "Authorization": f"Bearer {key}"})
+                             "Authorization": f"Bearer {key}",
+                             "User-Agent": GROQ_UA})
                 out = json.loads(urllib.request.urlopen(req, timeout=120).read())
                 result = _extract_json(out["choices"][0]["message"]["content"])
                 print(f"[groq] OK via {model}")
@@ -95,13 +117,25 @@ def groq_json(prompt):
             except urllib.error.HTTPError as e:
                 last = f"HTTP {e.code}: {e.read().decode()[:200]}"
                 print(f"[groq] {model} attempt {attempt}: {last}")
-                if e.code in (400, 401, 403, 404):
+                if e.code in (400, 401, 404):
+                    break
+                if e.code == 403:
+                    blocked = True
                     break
                 time.sleep(4)
             except Exception as e:
                 last = str(e)
                 print(f"[groq] {model} attempt {attempt}: {last}")
                 time.sleep(4)
+        if blocked:
+            try:
+                print(f"[groq] firewall blocked Python — trying curl for {model}")
+                result = _groq_call_curl(model, prompt, key)
+                print(f"[groq] OK via curl ({model})")
+                return result
+            except Exception as e:
+                last = str(e)
+                print(f"[groq] curl {model}: {last}")
     raise RuntimeError(f"Groq failed on all models. Last error: {last}")
 
 def gemini_json(prompt):

@@ -12,13 +12,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.11", cache: pip}
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
       - run: pip install -r requirements.txt
       - run: |
-          EP="EP-$(date +%Y%m%d-%H%M)"
-          python pipeline.py write   --episode "$EP" --topic "${{ github.event.inputs.topic }}"
+          EP="EP-${{ github.run_id }}"
+          python pipeline.py write   --episode "$EP" --topic "$TOPIC"
           python pipeline.py produce --episode "$EP"
           python pipeline.py notify  --episode "$EP"
         env:
+          TOPIC: ${{ github.event.inputs.topic }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

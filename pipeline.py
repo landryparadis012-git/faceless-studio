@@ -1,16 +1,34 @@
-"""Faceless 'Life at Every Level' pipeline."""
-import argparse, json, os, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
+"""Faceless 'Life at Every Level' pipeline. LLM: Groq primary, Gemini backup."""
+import argparse, json, os, random, socket, subprocess, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
+import requests
 
+socket.setdefaulttimeout(120)
 ROOT = Path(__file__).parent
 EPS = ROOT / "episodes"
 VOICE = "en-US-ChristopherNeural"
 FPS = 30
-FONT = os.environ.get("FONT", "DejaVuSans")
+FONT = os.environ.get("FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 IMG_URL = ("https://image.pollinations.ai/prompt/{p}"
            "?width=720&height=1280&seed={seed}&model=flux&nologo=true")
+GROQ = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b"]
 
-def sh(cmd): subprocess.run([str(c) for c in cmd], check=True, capture_output=True, text=True)
+TOPICS = [
+    "a poor village boy who becomes king",
+    "a maid who becomes a fashion queen",
+    "a street food cook who becomes a millionaire chef",
+    "a fisherman who discovers an underwater kingdom",
+    "a farmer's daughter who becomes a tech billionaire",
+    "an orphan boy who becomes emperor",
+    "a janitor who becomes a space station commander",
+]
+
+def sh(cmd):
+    p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"[cmd failed] {p.stderr[-2000:]}")
+        raise RuntimeError(f"command failed: {cmd[0]}")
 
 def dur(path):
     out = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries",
@@ -21,7 +39,7 @@ DEFAULT_BIBLE = {
     "character": "a kind middle-aged farmer man, short black hair, tan skin, simple beige tunic, weathered hands",
     "style": "cinematic photorealistic, warm golden hour light, rich detail, vertical composition, game concept art quality",
     "negative": "text, watermark, logo, deformed hands, extra limbs, blurry",
-    "seed": 777123
+    "seed": 777123,
 }
 
 WRITER_PROMPT = """You write viral TikTok "life at every level" scripts.
@@ -48,6 +66,44 @@ Return ONLY valid JSON, no markdown:
   "hashtags": ["#lifeateverylevel", "#villagelife", "#ai", "#fyp", "#satisfying"]}}
 Rules: environment escalates mud hut -> palace/city; visuals always describe the SAME person; no real brands or real people."""
 
+def _extract_json(txt):
+    txt = txt.strip()
+    i, j = txt.find("{"), txt.rfind("}")
+    if i == -1 or j == -1:
+        raise ValueError(f"no JSON object found in: {txt[:200]}")
+    return json.loads(txt[i:j + 1])
+
+def groq_json(prompt):
+    key = os.environ["GROQ_API_KEY"]
+    last = None
+    for model in GROQ_MODELS:
+        for attempt in range(1, 4):
+            try:
+                print(f"[groq] trying {model} (attempt {attempt}/3)")
+                body = {"model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 1.0}
+                req = urllib.request.Request(
+                    GROQ, data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json",
+                             "Authorization": f"Bearer {key}"})
+                out = json.loads(urllib.request.urlopen(req, timeout=120).read())
+                result = _extract_json(out["choices"][0]["message"]["content"])
+                print(f"[groq] OK via {model}")
+                return result
+            except urllib.error.HTTPError as e:
+                last = f"HTTP {e.code}: {e.read().decode()[:200]}"
+                print(f"[groq] {model} attempt {attempt}: {last}")
+                if e.code in (400, 401, 403, 404):
+                    break
+                time.sleep(4)
+            except Exception as e:
+                last = str(e)
+                print(f"[groq] {model} attempt {attempt}: {last}")
+                time.sleep(4)
+    raise RuntimeError(f"Groq failed on all models. Last error: {last}")
+
 def gemini_json(prompt):
     key = os.environ["GEMINI_API_KEY"]
     base = "https://generativelanguage.googleapis.com/v1beta"
@@ -60,141 +116,143 @@ def gemini_json(prompt):
               and "live" not in m["name"] and "native-audio" not in m["name"]]
     if not usable:
         raise RuntimeError(f"No usable Gemini models for this key. Got: {str(listing)[:400]}")
-    order = (["gemini-flash-latest"] if "gemini-flash-latest" in usable else []) + \
-            [m for m in usable if m != "gemini-flash-latest"]
+    model = "gemini-flash-latest" if "gemini-flash-latest" in usable else usable[0]
+    print(f"[gemini] using model: {model}")
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
-    last_err = None
-    for model in order[:4]:
-        for attempt in range(3):
+    req = urllib.request.Request(f"{base}/models/{model}:generateContent?key={key}",
+        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try:
+        out = json.loads(urllib.request.urlopen(req, timeout=120).read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Gemini HTTP {e.code}: {e.read().decode()[:500]}")
+    return _extract_json(out["candidates"][0]["content"]["parts"][0]["text"])
+
+def llm_json(prompt):
+    if os.environ.get("GROQ_API_KEY"):
+        try:
+            return groq_json(prompt)
+        except Exception as e:
+            print(f"[llm] Groq failed ({str(e)[:200]}) — trying Gemini backup")
+    return gemini_json(prompt)
+
+def cmd_write(ep_id, topic):
+    ep = EPS / ep_id
+    ep.mkdir(parents=True, exist_ok=True)
+    out = ep / "script.json"
+    if out.exists():
+        print(f"[write] {out} already exists — skipping (idempotent)")
+        return
+    topic = topic or random.choice(TOPICS)
+    print(f"[write] topic: {topic}")
+    data = llm_json(WRITER_PROMPT.format(topic=topic,
+                                         character=DEFAULT_BIBLE["character"],
+                                         style=DEFAULT_BIBLE["style"]))
+    for k in ("title", "hook", "caption"):
+        data.setdefault(k, "untitled")
+    data.setdefault("hashtags", ["#lifeateverylevel", "#ai", "#fyp"])
+    if not isinstance(data.get("levels"), list) or not data["levels"]:
+        raise RuntimeError(f"script has no levels. Raw keys: {list(data.keys())}")
+    for lv in data["levels"]:
+        lv.setdefault("label", "Level")
+        lv.setdefault("narration", "")
+        lv.setdefault("visual", DEFAULT_BIBLE["character"])
+    out.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    print(f"[write] OK -> {out}")
+
+def cmd_produce(ep_id):
+    ep = EPS / ep_id
+    sc = json.loads((ep / "script.json").read_text())
+    imgs, auds, segs = ep / "images", ep / "audio", ep / "segs"
+    for d in (imgs, auds, segs):
+        d.mkdir(parents=True, exist_ok=True)
+    bible = DEFAULT_BIBLE
+    for i, lv in enumerate(sc["levels"], 1):
+        out = imgs / f"L{i}.jpg"
+        if out.exists() and out.stat().st_size > 10000:
+            print(f"[img] L{i} cached"); continue
+        prompt = f"{lv['visual']}, {bible['style']}"
+        url = IMG_URL.format(p=urllib.parse.quote(prompt), seed=bible["seed"] + i)
+        ok = False
+        for attempt in range(1, 6):
             try:
-                print(f"[gemini] trying {model} (attempt {attempt+1})")
-                req = urllib.request.Request(
-                    f"{base}/models/{model}:generateContent?key={key}",
-                    data=json.dumps(body).encode(),
-                    headers={"Content-Type": "application/json"})
-                out = json.loads(urllib.request.urlopen(req, timeout=120).read())
-                print(f"[gemini] OK with model: {model}")
-                return json.loads(out["candidates"][0]["content"]["parts"][0]["text"])
-            except urllib.error.HTTPError as e:
-                last_err = f"Gemini HTTP {e.code}: {e.read().decode()[:300]}"
-                print(f"[gemini] {last_err}")
-                if e.code in (429, 500, 503):
-                    time.sleep(20 * (attempt + 1))
-                else:
-                    break
+                urllib.request.urlretrieve(url, out)
+                if out.stat().st_size > 10000:
+                    ok = True; break
+                print(f"[img] L{i} attempt {attempt}: file too small, retrying")
             except Exception as e:
-                last_err = str(e); print(f"[gemini] {last_err}"); time.sleep(10)
-    raise RuntimeError(f"All Gemini models busy/unavailable. Last error: {last_err}")
-
-def cmd_write(name, topic):
-    ep = EPS / name; ep.mkdir(parents=True, exist_ok=True)
-    bible_p = ep / "character_bible.json"
-    if not bible_p.exists():
-        bible_p.write_text(json.dumps(DEFAULT_BIBLE, indent=2))
-    bible = json.loads(bible_p.read_text())
-    prompt = WRITER_PROMPT.format(topic=topic or "a villager's life upgrading at every level",
-                                  character=bible["character"], style=bible["style"])
-    script = gemini_json(prompt)
-    assert len(script.get("levels", [])) == 7, f"expected 7 levels, got {len(script.get('levels', []))}"
-    (ep / "script.json").write_text(json.dumps(script, indent=2))
-    (ep / "metadata.json").write_text(json.dumps({
-        "title": script["title"], "caption": script["caption"],
-        "hashtags": " ".join(script["hashtags"]),
-        "youtube_visibility": "private",
-        "ai_disclosure": "AI-generated imagery and voice",
-        "episode": name}, indent=2))
-    print(f"[write] OK -> {ep/'script.json'}")
-
-def gen_image(prompt, seed, out: Path):
-    if out.exists(): return
-    url = IMG_URL.format(p=urllib.parse.quote(prompt), seed=seed)
-    for attempt in range(5):
+                print(f"[img] L{i} attempt {attempt}: {e}")
+            time.sleep(3)
+        if not ok:
+            raise RuntimeError(f"image L{i} failed after 5 attempts")
+        print(f"[img] L{i} ok")
+    for i, lv in enumerate(sc["levels"], 1):
+        out = auds / f"L{i}.mp3"
+        if out.exists() and out.stat().st_size > 1000:
+            print(f"[tts] L{i} cached"); continue
+        txt = lv["narration"] if i > 1 else f"{sc['hook']} {lv['narration']}"
+        for attempt in range(1, 4):
+            try:
+                sh(["edge-tts", "--voice", VOICE, "--text", txt, "--write-media", out])
+                break
+            except Exception as e:
+                print(f"[tts] L{i} attempt {attempt}: {e}")
+                time.sleep(3)
+        else:
+            raise RuntimeError(f"narration L{i} failed after 3 attempts")
+        print(f"[tts] L{i} ok")
+    seg_files = []
+    for i, lv in enumerate(sc["levels"], 1):
+        sf = segs / f"seg{i}.mp4"
+        seg_files.append(sf)
+        if sf.exists():
+            print(f"[seg] {i} cached"); continue
+        a = dur(auds / f"L{i}.mp3")
+        frames = int(a * FPS) + FPS
+        label = "".join(ch for ch in lv["label"] if ch.isalnum() or ch.isspace()) or f"Level {i}"
+        vf = ("scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,"
+              f"zoompan=z='min(zoom+0.0015,1.25)':d={frames}:s=720x1280:fps={FPS},"
+              f"drawtext=text='{label}':fontcolor=white:fontsize=48:box=1:"
+              f"boxcolor=black@0.5:boxborderw=12:x=(w-text_w)/2:y=h-160:fontfile={FONT}")
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            data = urllib.request.urlopen(req, timeout=180).read()
-            if len(data) > 10_000:
-                out.write_bytes(data); print(f"[img] {out.name} ({len(data)//1024}KB)"); return
-        except Exception as e:
-            print(f"[img] retry {attempt+1}: {e}"); time.sleep(5 * (attempt + 1))
-    raise RuntimeError(f"image failed: {out.name}")
+            sh(["ffmpeg", "-y", "-loop", "1", "-i", imgs / f"L{i}.jpg", "-i", auds / f"L{i}.mp3",
+                "-vf", vf, "-t", f"{a:.2f}", "-r", str(FPS), "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest", sf])
+        except Exception:
+            if sf.exists():
+                sf.unlink()
+            raise
+        print(f"[seg] {i} ok ({a:.1f}s)")
+    lst = ep / "list.txt"
+    lst.write_text("".join(f"file '{s}'\n" for s in seg_files))
+    sh(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+        "-c", "copy", ep / "video.mp4"])
+    meta = {"episode": ep_id, "title": sc["title"], "caption": sc["caption"],
+            "hashtags": sc["hashtags"],
+            "platforms": {"youtube": "private", "tiktok": "draft"},
+            "ai_disclosure": "Created with AI tools"}
+    (ep / "metadata.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    size = (ep / "video.mp4").stat().st_size / 1e6
+    print(f"[produce] OK -> {ep / 'video.mp4'} ({size:.1f} MB)")
 
-def tts(text, out: Path):
-    if out.exists(): return dur(out)
-    for attempt in range(4):
-        try:
-            sh(["edge-tts", "--voice", VOICE, "--text", text, "--write-media", out])
-            return dur(out)
-        except Exception as e:
-            print(f"[tts] retry {attempt+1}: {e}"); time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"tts failed: {out.name}")
-
-def segment(img: Path, text: str, label: str, wav: Path, out: Path):
-    d = dur(wav) + 0.9
-    frames = int(d * FPS) + 1
-    label = label.replace(":", " ").replace("'", "")
-    vf = (f"scale=1440:2560,"
-          f"zoompan=z='min(zoom+0.0012,1.25)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-          f":d={frames}:s=720x1280:fps={FPS},"
-          f"drawtext=font={FONT}:text='{label}':fontsize=52:fontcolor=white:"
-          f"borderw=3:x=(w-text_w)/2:y=90:enable='between(t,0,1.4)',"
-          f"format=yuv420p")
-    sh(["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS), "-i", img, "-i", wav,
-        "-filter_complex", f"[0:v]{vf}[v];[1:a]adelay=250:all=1,apad=whole_dur={d}[a]",
-        "-map", "[v]", "-map", "[a]", "-t", f"{d:.2f}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", out])
-    return d
-
-def cmd_produce(name):
-    ep = EPS / name
-    bible = json.loads((ep / "character_bible.json").read_text())
-    script = json.loads((ep / "script.json").read_text())
-    imgs, segs, list_f = ep / "images", ep / "segments", ep / "list.txt"
-    imgs.mkdir(exist_ok=True); segs.mkdir(exist_ok=True)
-
-    hook_wav = ep / "hook.mp3"
-    tts(script["hook"], hook_wav)
-    parts = [(imgs / "hook.jpg",
-              f"{bible['character']}, {bible['style']}, dramatic establishing shot, mysterious atmosphere",
-              "WATCH", hook_wav)]
-    for i, lv in enumerate(script["levels"], start=1):
-        parts.append((imgs / f"L{i}.jpg",
-                      f"{bible['character']}, {bible['style']}, {lv['visual']}, {bible['negative']}",
-                      lv["label"], ep / f"nar{i}.mp3"))
-        tts(lv["narration"], ep / f"nar{i}.mp3")
-
-    total = 0.0
-    for i, (img, prompt, label, wav) in enumerate(parts):
-        gen_image(prompt, bible["seed"] + i, img)
-        total += segment(img, prompt, label, wav, segs / f"seg{i}.mp4")
-
-    list_f.write_text("".join(f"file '{s.resolve()}'\n" for s in sorted(segs.glob("seg*.mp4"))))
-    concat = ep / "concat.mp4"
-    sh(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_f, "-c", "copy", concat])
-
-    bgm = ep / "bgm.mp3"
-    final = ep / "video.mp4"
-    if bgm.exists():
-        sh(["ffmpeg", "-y", "-i", concat, "-stream_loop", "-1", "-i", bgm,
-            "-filter_complex", "[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first[a]",
-            "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", final])
-    else:
-        concat.replace(final)
-
-    size = final.stat().st_size
-    assert size < 48_000_000, f"video {size/1e6:.1f}MB exceeds Telegram 50MB"
-    print(f"[produce] OK -> {final}  ({dur(final):.1f}s, {size/1e6:.1f}MB)")
-
-def cmd_notify(name):
-    import requests
-    ep = EPS / name
-    meta = json.loads((ep / "metadata.json").read_text())
-    caption = (f"🎬 {meta['title']}\n\n{meta['caption']}\n\n{meta['hashtags']}\n\n"
-               f"EP: {meta['episode']} · visibility: {meta['youtube_visibility']}")
-    r = requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendVideo",
-                      data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "caption": caption[:1024]},
-                      files={"video": open(ep / "video.mp4", "rb")}, timeout=600)
+def cmd_notify(ep_id):
+    ep = EPS / ep_id
+    sc = json.loads((ep / "script.json").read_text())
+    text = f"🎬 {sc['title']}\n\n{sc['caption']}\n\n{' '.join(sc['hashtags'])}\n\nepisode: {ep_id}"
+    vid = ep / "video.mp4"
+    size_mb = vid.stat().st_size / 1e6
+    api = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}"
+    if size_mb >= 49:
+        r = requests.post(f"{api}/sendMessage",
+                          data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": text})
+        print(f"[notify] {r.status_code} {r.text[:200]}")
+        r.raise_for_status()
+        print(f"[notify] video is {size_mb:.0f} MB — download it from the run's Artifacts")
+        return
+    with open(vid, "rb") as f:
+        r = requests.post(f"{api}/sendVideo",
+                          data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "caption": text[:1024]},
+                          files={"video": f}, timeout=600)
     print(f"[notify] {r.status_code} {r.text[:200]}")
     r.raise_for_status()
 

@@ -120,13 +120,27 @@ def gemini_json(prompt):
     print(f"[gemini] using model: {model}")
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
-    req = urllib.request.Request(f"{base}/models/{model}:generateContent?key={key}",
-        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    try:
-        out = json.loads(urllib.request.urlopen(req, timeout=120).read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Gemini HTTP {e.code}: {e.read().decode()[:500]}")
-    return _extract_json(out["candidates"][0]["content"]["parts"][0]["text"])
+    last = None
+    for attempt in range(1, 5):
+        try:
+            print(f"[gemini] attempt {attempt}/4")
+            req = urllib.request.Request(f"{base}/models/{model}:generateContent?key={key}",
+                data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            out = json.loads(urllib.request.urlopen(req, timeout=120).read())
+            return _extract_json(out["candidates"][0]["content"]["parts"][0]["text"])
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}: {e.read().decode()[:300]}"
+            print(f"[gemini] attempt {attempt}: {last}")
+            if e.code not in (429, 500, 502, 503, 504):
+                raise
+            if attempt < 4:
+                time.sleep(25)
+        except Exception as e:
+            last = str(e)
+            print(f"[gemini] attempt {attempt}: {last}")
+            if attempt < 4:
+                time.sleep(25)
+    raise RuntimeError(f"Gemini failed after 4 attempts. Last: {last}")
 
 def llm_json(prompt):
     if os.environ.get("GROQ_API_KEY"):

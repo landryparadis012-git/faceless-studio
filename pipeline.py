@@ -1,5 +1,5 @@
 """Faceless 'Life at Every Level' pipeline. LLM: Groq primary, Gemini backup."""
-import argparse, json, os, random, socket, subprocess, time, urllib.parse, urllib.request, urllib.error
+import argparse, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 import requests
 
@@ -256,12 +256,26 @@ def cmd_notify(ep_id):
     print(f"[notify] {r.status_code} {r.text[:200]}")
     r.raise_for_status()
 
+def _tell(text):
+    try:
+        requests.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
+                      data={"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": text[:4000]}, timeout=60)
+    except Exception:
+        pass
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("cmd", choices=["write", "produce", "notify"])
     p.add_argument("--episode", required=True)
     p.add_argument("--topic")
     a = p.parse_args()
-    {"write": lambda: cmd_write(a.episode, a.topic),
-     "produce": lambda: cmd_produce(a.episode),
-     "notify": lambda: cmd_notify(a.episode)}[a.cmd]()
+    try:
+        {"write": lambda: cmd_write(a.episode, a.topic),
+         "produce": lambda: cmd_produce(a.episode),
+         "notify": lambda: cmd_notify(a.episode)}[a.cmd]()
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        _tell(f"❌ run failed ({a.cmd})\n\n{tb[-2500:]}")
+        sys.exit(1)

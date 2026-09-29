@@ -8,23 +8,54 @@ jobs:
   produce:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      TOPIC: ${{ github.event.inputs.topic }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.11", cache: pip}
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
       - run: pip install -r requirements.txt
-      - run: |
+      - name: run pipeline
+        id: run
+        continue-on-error: true
+        run: |
+          set -o pipefail
           EP="EP-${{ github.run_id }}"
-          python pipeline.py write   --episode "$EP" --topic "$TOPIC"
-          python pipeline.py produce --episode "$EP"
-          python pipeline.py notify  --episode "$EP"
-        env:
-          TOPIC: ${{ github.event.inputs.topic }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS=0
+          python -m py_compile pipeline.py 2>&1 | tee /tmp/log.txt || STATUS=1
+          if [ "$STATUS" = "0" ]; then
+            python pipeline.py write   --episode "$EP" --topic "$TOPIC" 2>&1 | tee -a /tmp/log.txt || STATUS=1
+          fi
+          if [ "$STATUS" = "0" ]; then
+            python pipeline.py produce --episode "$EP" 2>&1 | tee -a /tmp/log.txt || STATUS=1
+          fi
+          if [ "$STATUS" = "0" ]; then
+            python pipeline.py notify  --episode "$EP" 2>&1 | tee -a /tmp/log.txt || STATUS=1
+          fi
+          cat /tmp/log.txt
+          [ "$STATUS" = "0" ] || { echo "PIPELINE FAILED"; exit 1; }
+      - name: report errors to telegram
+        if: ${{ always() && steps.run.outcome != 'success' }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          try:
+              log = open('/tmp/log.txt', encoding='utf-8', errors='replace').read()[-2500:]
+          except Exception:
+              log = 'PIPELINE NEVER STARTED - an earlier setup step failed. Open the failed run in Actions, tap the red-x step, read its log.'
+          msg = 'PIPELINE FAILED - real error below:\n\n' + log
+          data = {'chat_id': os.environ['TELEGRAM_CHAT_ID'], 'text': msg[:4000]}
+          req = urllib.request.Request(
+              'https://api.telegram.org/bot' + os.environ['TELEGRAM_BOT_TOKEN'] + '/sendMessage',
+              data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'})
+          urllib.request.urlopen(req, timeout=60)
+          PY
+          exit 1
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: episodes, path: "episodes/*/[!s]*", retention-days: 3}

@@ -1,5 +1,5 @@
-"""Faceless series studio v5. Groq (curl fallback) + Gemini backup. Cloudflare images. Series memory."""
-import argparse, base64, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
+"""Faceless series studio v6. Groq + Gemini backup. Cloudflare images. Series memory. Limit auto-resume."""
+import argparse, base64, datetime, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 import requests
 
@@ -13,6 +13,9 @@ GROQ = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_UA = "faceless-studio/1.0"
 GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 MAX_EPISODES = 8
+
+class DailyLimitError(Exception):
+    pass
 
 def sh(cmd):
     p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
@@ -85,6 +88,7 @@ def _groq_call_curl(model, prompt, key):
     payload = json.dumps({"model": model,
                           "messages": [{"role": "user", "content": prompt}],
                           "response_format": {"type": "json_object"},
+                          "max_completion_tokens": 6000,
                           "temperature": 1.0})
     p = subprocess.run(["curl", "-s", "-w", "\n%{http_code}", "--max-time", "120",
                         "-X", "POST", GROQ,
@@ -111,6 +115,7 @@ def groq_json(prompt):
                 body = {"model": model,
                         "messages": [{"role": "user", "content": prompt}],
                         "response_format": {"type": "json_object"},
+                        "max_completion_tokens": 6000,
                         "temperature": 1.0}
                 req = urllib.request.Request(
                     GROQ, data=json.dumps(body).encode(),
@@ -201,6 +206,7 @@ def gen_image(prompt, out):
          {"prompt": prompt, "width": 576, "height": 1024}),
     ]
     last = None
+    limit_hits = 0
     for name, model, body in models:
         for attempt in range(1, 4):
             try:
@@ -223,9 +229,16 @@ def gen_image(prompt, out):
                     return
                 raise ValueError("image file too small")
             except urllib.error.HTTPError as e:
-                last = f"HTTP {e.code}: {e.read().decode()[:120]}"
+                last = f"HTTP {e.code}: {e.read().decode()[:200]}"
                 print(f"[img] {name} attempt {attempt}: {last}")
-                if e.code in (401, 402, 403, 404):
+                low = last.lower()
+                is_daily = (e.code == 402 or
+                            (e.code == 429 and any(k in low for k in ("daily", "limit", "quota", "neuron"))))
+                if is_daily:
+                    limit_hits += 1
+                    if limit_hits >= 2:
+                        raise DailyLimitError(f"Cloudflare free daily limit reached. Last: {last[:150]}")
+                elif e.code in (401, 403, 404):
                     break
                 if attempt < 3:
                     time.sleep(5)
@@ -279,19 +292,41 @@ def cmd_write(ep_id, topic):
     if topic:
         memory_text += f"\nCreator's brief (follow it): {topic}"
     print(f"[write] episode #{n} of series")
-    data = llm_json(WRITER_PROMPT.format(memory=memory_text,
-                                         character=DEFAULT_BIBLE["character"],
-                                         style=DEFAULT_BIBLE["style"]))
+    data = None
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            probe = memory_text
+            if last_err:
+                probe += (f"\nIMPORTANT: your previous answer was rejected ({last_err}). "
+                          "Return ALL 14 shots AND the complete memory object.")
+            data = llm_json(WRITER_PROMPT.format(memory=probe,
+                                                 character=DEFAULT_BIBLE["character"],
+                                                 style=DEFAULT_BIBLE["style"]))
+            if isinstance(data.get("levels"), list) and 10 <= len(data["levels"]) <= 16:
+                break
+            last_err = f"only {len(data.get('levels', []))} shots"
+            data = None
+        except Exception as e:
+            last_err = str(e)[:150]
+            data = None
+    if data is None:
+        raise RuntimeError(f"script writer failed after 3 attempts. Last problem: {last_err}")
     for k in ("title", "hook", "caption"):
         data.setdefault(k, "untitled")
     data.setdefault("hashtags", ["#lifeateverylevel", "#ai", "#fyp"])
-    if not isinstance(data.get("levels"), list) or not (10 <= len(data["levels"]) <= 16):
-        raise RuntimeError(f"expected ~14 shots, got {len(data.get('levels', []))}. Keys: {list(data.keys())}")
     for lv in data["levels"]:
         lv.setdefault("label", "Part")
         lv.setdefault("narration", "")
         lv.setdefault("visual", DEFAULT_BIBLE["character"])
     mem = data.get("memory", {}) if isinstance(data.get("memory"), dict) else {}
+    if not mem:
+        print("[memory] model omitted the memory object — rebuilding it from the script")
+        all_narr = " ".join(lv["narration"] for lv in data["levels"])
+        mem = {"series_title": str(data.get("title") or "Untitled Series")[:120],
+               "this_episode_recap": all_narr[:600],
+               "ending_cliffhanger": data["levels"][-1]["narration"][:400],
+               "ending_pattern_used": ""}
     st2 = {"series_title": str(mem.get("series_title") or data.get("title") or "Untitled Series")[:120],
            "episode_number": n,
            "last_recap": str(mem.get("this_episode_recap", ""))[:600],
@@ -405,6 +440,15 @@ if __name__ == "__main__":
         {"write": lambda: cmd_write(a.episode, a.topic),
          "produce": lambda: cmd_produce(a.episode),
          "notify": lambda: cmd_notify(a.episode)}[a.cmd]()
+    except DailyLimitError:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        reset = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        hrs = (reset - now).total_seconds() / 3600
+        reset_s = reset.strftime("%Y-%m-%d %H:%M UTC")
+        open("/tmp/limit_flag.txt", "w").write(reset.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        print(f"[limit] daily free limit hit — resets {reset_s} (~{hrs:.0f}h)")
+        _tell(f"🛑 Daily free limit reached.\n\nResets at {reset_s} (in ~{hrs:.0f}h).\n\nThe next episode will AUTO-RETRY about an hour after reset — nothing is lost. No need to /start (but you can if you're impatient).")
+        sys.exit(1)
     except Exception:
         import traceback
         tb = traceback.format_exc()

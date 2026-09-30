@@ -1,4 +1,4 @@
-"""Faceless 'Life at Every Level' pipeline. LLM: Groq (curl fallback) + Gemini backup. Images: Cloudflare Workers AI."""
+"""Faceless series studio. LLM: Groq (curl fallback) + Gemini backup. Images: Cloudflare. Memory: repo folder."""
 import argparse, base64, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 import requests
@@ -12,16 +12,7 @@ FONT = os.environ.get("FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.
 GROQ = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_UA = "faceless-studio/1.0"
 GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
-
-TOPICS = [
-    "a poor village boy who becomes king",
-    "a maid who becomes a fashion queen",
-    "a street food cook who becomes a millionaire chef",
-    "a fisherman who discovers an underwater kingdom",
-    "a farmer's daughter who becomes a tech billionaire",
-    "an orphan boy who becomes emperor",
-    "a janitor who becomes a space station commander",
-]
+MAX_EPISODES = 8
 
 def sh(cmd):
     p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True)
@@ -41,29 +32,41 @@ DEFAULT_BIBLE = {
     "seed": 777123,
 }
 
-WRITER_PROMPT = """You write viral TikTok "life at every level" scripts.
-Topic: {topic}
+WRITER_PROMPT = """You write viral TikTok series episodes in the "life at every level" style.
+{memory}
 
-CHARACTER (visual consistency — every level MUST reuse this exact character description):
+CHARACTER (visual consistency — EVERY shot MUST reuse this exact character description):
 {character}
 
 STYLE (append to every visual): {style}
 
+Structure: 7 levels (Level 1, 2, 5, 10, 25, 50, 100), each level has EXACTLY 2 shots —
+shot A = arrival (stepping into the stage), shot B = payoff (win, shock, or lesson).
+That is EXACTLY 14 shots. The 14th shot MUST end on a cliffhanger for the next episode.
+
 Return ONLY valid JSON, no markdown:
-{{"title": "<clickbait <=60 chars>",
+{{"title": "<series name + Episode number, <=60 chars>",
   "hook": "<opening narration line, <=15 words>",
   "levels": [
-    {{"label": "Level 1",  "narration": "<punchy line <=18 words>", "visual": "<same character + STARTER environment>"}},
-    {{"label": "Level 2",  "narration": "...", "visual": "..."}},
-    {{"label": "Level 5",  "narration": "...", "visual": "..."}},
-    {{"label": "Level 10", "narration": "...", "visual": "..."}},
-    {{"label": "Level 25", "narration": "...", "visual": "..."}},
-    {{"label": "Level 50", "narration": "...", "visual": "..."}},
-    {{"label": "Level 100","narration": "...", "visual": "<absurd max-luxury finale>"}}
+    {{"label": "Part 1",  "narration": "<17-22 vivid storytelling words>", "visual": "<same character + STARTER environment, arrival>"}},
+    {{"label": "Part 2",  "narration": "...", "visual": "<same character, level 1 payoff>"}},
+    {{"label": "Part 3",  "narration": "...", "visual": "<same character, level 2 arrival>"}},
+    {{"label": "Part 4",  "narration": "...", "visual": "<same character, level 2 payoff>"}},
+    {{"label": "Part 5",  "narration": "...", "visual": "<same character, level 5 arrival>"}},
+    {{"label": "Part 6",  "narration": "...", "visual": "<same character, level 5 payoff>"}},
+    {{"label": "Part 7",  "narration": "...", "visual": "<same character, level 10 arrival>"}},
+    {{"label": "Part 8",  "narration": "...", "visual": "<same character, level 10 payoff>"}},
+    {{"label": "Part 9",  "narration": "...", "visual": "<same character, level 25 arrival>"}},
+    {{"label": "Part 10", "narration": "...", "visual": "<same character, level 25 payoff>"}},
+    {{"label": "Part 11", "narration": "...", "visual": "<same character, level 50 arrival>"}},
+    {{"label": "Part 12", "narration": "...", "visual": "<same character, level 50 payoff>"}},
+    {{"label": "Part 13", "narration": "...", "visual": "<same character, level 100 arrival>"}},
+    {{"label": "Part 14", "narration": "...<ends on cliffhanger>", "visual": "<same character, level 100 payoff + cliffhanger image>"}}
   ],
   "caption": "<caption <=150 chars>",
-  "hashtags": ["#lifeateverylevel", "#villagelife", "#ai", "#fyp", "#satisfying"]}}
-Rules: environment escalates mud hut -> palace/city; visuals always describe the SAME person; no real brands or real people."""
+  "hashtags": ["#lifeateverylevel", "#villagelife", "#ai", "#fyp", "#satisfying"],
+  "memory": {{"series_title": "<series name>", "this_episode_recap": "<3-4 sentences: what happened in THIS episode>", "ending_cliffhanger": "<exact cliffhanger the next episode must resolve>"}}}}
+Rules: environment escalates mud hut -> palace/city; visuals always describe the SAME person; the 14 narrations tell ONE continuous story (each continues the last); no real brands or real people."""
 
 def _extract_json(txt):
     txt = txt.strip()
@@ -184,6 +187,7 @@ def llm_json(prompt):
 def gen_image(prompt, out):
     acct = os.environ["CLOUDFLARE_ACCOUNT_ID"]
     key = os.environ["CLOUDFLARE_API_TOKEN"]
+    print(f"[img] using account id: {acct[:4]}... ({len(acct)} chars)")
     models = [
         ("flux", "@cf/black-forest-labs/flux-1-schnell",
          {"prompt": prompt, "steps": 4}),
@@ -229,6 +233,21 @@ def gen_image(prompt, out):
                     out.unlink()
     raise RuntimeError(f"image generation failed for {out.name}. Last: {last}")
 
+def load_state():
+    f = ROOT / "memory" / "series_state.json"
+    try:
+        return json.loads(f.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        bak = f.with_suffix(".json.bak")
+        print(f"[memory] memory file unreadable — archiving it and starting a fresh series")
+        try:
+            f.rename(bak)
+        except Exception:
+            pass
+        return None
+
 def cmd_write(ep_id, topic):
     ep = EPS / ep_id
     ep.mkdir(parents=True, exist_ok=True)
@@ -236,20 +255,42 @@ def cmd_write(ep_id, topic):
     if out.exists():
         print(f"[write] {out} already exists — skipping (idempotent)")
         return
-    topic = topic or random.choice(TOPICS)
-    print(f"[write] topic: {topic}")
-    data = llm_json(WRITER_PROMPT.format(topic=topic,
+    st = load_state()
+    if st and not st.get("finished") and st.get("episode_number", 0) < MAX_EPISODES:
+        n = st["episode_number"] + 1
+        memory_text = (f"CONTINUING SERIES '{st['series_title']}' — Episode {n} of {MAX_EPISODES}.\n"
+                       f"Recap of episode {st['episode_number']}: {st.get('last_recap', '')}\n"
+                       f"It ended on this cliffhanger: {st.get('ending_cliffhanger', '')}\n"
+                       "Continue the SAME story with the SAME characters. Do NOT start over.")
+    else:
+        n = 1
+        memory_text = ("START A BRAND NEW SERIES (nothing exists yet). Invent a fresh premise, "
+                       f"characters and series title. It will run {MAX_EPISODES} episodes, "
+                       "so plant seeds for future growth.")
+    if topic:
+        memory_text += f"\nCreator's brief (follow it): {topic}"
+    print(f"[write] episode #{n} of series")
+    data = llm_json(WRITER_PROMPT.format(memory=memory_text,
                                          character=DEFAULT_BIBLE["character"],
                                          style=DEFAULT_BIBLE["style"]))
     for k in ("title", "hook", "caption"):
         data.setdefault(k, "untitled")
     data.setdefault("hashtags", ["#lifeateverylevel", "#ai", "#fyp"])
-    if not isinstance(data.get("levels"), list) or not data["levels"]:
-        raise RuntimeError(f"script has no levels. Raw keys: {list(data.keys())}")
+    if not isinstance(data.get("levels"), list) or len(data["levels"]) < 10:
+        raise RuntimeError(f"expected ~14 shots, got {len(data.get('levels', []))}. Keys: {list(data.keys())}")
     for lv in data["levels"]:
-        lv.setdefault("label", "Level")
+        lv.setdefault("label", "Part")
         lv.setdefault("narration", "")
         lv.setdefault("visual", DEFAULT_BIBLE["character"])
+    mem = data.get("memory", {}) if isinstance(data.get("memory"), dict) else {}
+    st2 = {"series_title": str(mem.get("series_title") or data.get("title") or "Untitled Series")[:120],
+           "episode_number": n,
+           "last_recap": str(mem.get("this_episode_recap", ""))[:600],
+           "ending_cliffhanger": str(mem.get("ending_cliffhanger", ""))[:400],
+           "finished": n >= MAX_EPISODES}
+    (ROOT / "memory").mkdir(exist_ok=True)
+    (ROOT / "memory" / "series_state.json").write_text(json.dumps(st2, indent=2, ensure_ascii=False))
+    print(f"[memory] episode {n}/{MAX_EPISODES} recorded" + (" — SERIES COMPLETE! next /start = new series" if st2["finished"] else ""))
     out.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     print(f"[write] OK -> {out}")
 
@@ -290,7 +331,7 @@ def cmd_produce(ep_id):
             print(f"[seg] {i} cached"); continue
         a = dur(auds / f"L{i}.mp3")
         frames = int(a * FPS) + FPS
-        label = "".join(ch for ch in lv["label"] if ch.isalnum() or ch.isspace()) or f"Level {i}"
+        label = "".join(ch for ch in lv["label"] if ch.isalnum() or ch.isspace()) or f"Part {i}"
         vf = ("scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,"
               f"zoompan=z='min(zoom+0.0015,1.25)':d={frames}:s=720x1280:fps={FPS},"
               f"drawtext=text='{label}':fontcolor=white:fontsize=48:box=1:"

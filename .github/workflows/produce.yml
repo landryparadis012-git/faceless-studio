@@ -1,8 +1,9 @@
 name: produce
 on:
   workflow_dispatch:
-    inputs: {topic: {description: "optional topic override", required: false}}
-  schedule: [{cron: "0 9 * * *"}]
+    inputs: {topic: {description: "optional brief — empty = continue the series", required: false}}
+permissions:
+  contents: write
 concurrency: {group: produce, cancel-in-progress: false}
 jobs:
   produce:
@@ -16,9 +17,9 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-
     steps:
       - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
       - uses: actions/setup-python@v5
         with: {python-version: "3.11", cache: pip}
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
@@ -42,22 +43,30 @@ jobs:
           fi
           cat /tmp/log.txt
           [ "$STATUS" = "0" ] || { echo "PIPELINE FAILED"; exit 1; }
+      - name: save series memory
+        if: success()
+        run: |
+          git config user.name "studio-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase origin main || true
+          git add memory/ || true
+          git diff --cached --quiet && exit 0
+          git commit -m "memory: series progress"
+          for i in 1 2 3; do git push && break || (git pull --rebase origin main; sleep 3); done
       - name: report errors to telegram
         if: ${{ always() && steps.run.outcome != 'success' }}
         run: |
-          python - <<'PY'
-          import json, os, urllib.request
-          try:
-              log = open('/tmp/log.txt', encoding='utf-8', errors='replace').read()[-2500:]
-          except Exception:
-              log = 'PIPELINE NEVER STARTED - an earlier setup step failed. Open the failed run in Actions, tap the red-x step, read its log.'
-          msg = 'PIPELINE FAILED - real error below:\n\n' + log
-          data = {'chat_id': os.environ['TELEGRAM_CHAT_ID'], 'text': msg[:4000]}
-          req = urllib.request.Request(
-              'https://api.telegram.org/bot' + os.environ['TELEGRAM_BOT_TOKEN'] + '/sendMessage',
-              data=json.dumps(data).encode(), headers={'Content-Type': 'application/json'})
-          urllib.request.urlopen(req, timeout=60)
-          PY
+          if [ -f /tmp/log.txt ]; then
+            TAIL=$(tail -c 3000 /tmp/log.txt)
+          else
+            TAIL="PIPELINE NEVER STARTED - an earlier setup step failed."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=PIPELINE FAILED - real error below:
+
+          ${TAIL}"
+          echo ""
           exit 1
       - uses: actions/upload-artifact@v4
         if: always()

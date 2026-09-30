@@ -48,25 +48,40 @@ jobs:
         run: |
           git config user.name "studio-bot"
           git config user.email "bot@users.noreply.github.com"
-          git pull --rebase origin main || true
+          git pull --rebase --autostash origin main || true
           git add memory/ || true
           git diff --cached --quiet && exit 0
           git commit -m "memory: series progress"
-          for i in 1 2 3; do git push && break || (git pull --rebase origin main; sleep 3); done
+          for i in 1 2 3; do git push && break || (git pull --rebase --autostash origin main; sleep 3); done
       - name: report errors to telegram
         if: ${{ always() && steps.run.outcome != 'success' }}
         run: |
-          if [ -f /tmp/log.txt ]; then
-            TAIL=$(tail -c 3000 /tmp/log.txt)
+          if [ -f /tmp/limit_flag.txt ]; then
+            RESET=$(cat /tmp/limit_flag.txt)
+            mkdir -p memory
+            echo "${RESET}" > memory/autoresume.flag
+            git config user.name "studio-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add memory/autoresume.flag
+            git diff --cached --quiet || git commit -m "autoresume flag"
+            for i in 1 2 3; do git push && break || (git pull --rebase --autostash origin main; sleep 3); done
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=🛑 Daily free limit reached. Resets ${RESET} UTC. Auto-retry is scheduled — nothing is lost."
+            echo ""
           else
-            TAIL="PIPELINE NEVER STARTED - an earlier setup step failed."
-          fi
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=PIPELINE FAILED - real error below:
+            if [ -f /tmp/log.txt ]; then
+              TAIL=$(tail -c 3000 /tmp/log.txt)
+            else
+              TAIL="PIPELINE NEVER STARTED - an earlier setup step failed."
+            fi
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=PIPELINE FAILED - real error below:
 
           ${TAIL}"
-          echo ""
+            echo ""
+          fi
           exit 1
       - uses: actions/upload-artifact@v4
         if: always()

@@ -1,4 +1,4 @@
-"""Faceless 'Life at Every Level' pipeline. LLM: Groq (curl fallback). Images: Cloudflare Workers AI."""
+"""Faceless 'Life at Every Level' pipeline. LLM: Groq (curl fallback) + Gemini backup. Images: Cloudflare Workers AI."""
 import argparse, base64, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 import requests
@@ -135,6 +135,51 @@ def groq_json(prompt):
                 last = str(e)
                 print(f"[groq] curl {model}: {last}")
     raise RuntimeError(f"Groq failed on all models. Last error: {last}")
+
+def gemini_json(prompt):
+    key = os.environ["GEMINI_API_KEY"]
+    base = "https://generativelanguage.googleapis.com/v1beta"
+    req = urllib.request.Request(f"{base}/models?key={key}&pageSize=100")
+    listing = json.loads(urllib.request.urlopen(req, timeout=60).read())
+    usable = [m["name"].split("/")[-1] for m in listing.get("models", [])
+              if "generateContent" in m.get("supportedGenerationMethods", [])
+              and "flash" in m["name"] and "embedding" not in m["name"]
+              and "image" not in m["name"] and "tts" not in m["name"]
+              and "live" not in m["name"] and "native-audio" not in m["name"]]
+    if not usable:
+        raise RuntimeError(f"No usable Gemini models for this key. Got: {str(listing)[:400]}")
+    model = "gemini-flash-latest" if "gemini-flash-latest" in usable else usable[0]
+    print(f"[gemini] using model: {model}")
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
+    last = None
+    for attempt in range(1, 5):
+        try:
+            print(f"[gemini] attempt {attempt}/4")
+            req = urllib.request.Request(f"{base}/models/{model}:generateContent?key={key}",
+                data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            out = json.loads(urllib.request.urlopen(req, timeout=120).read())
+            return _extract_json(out["candidates"][0]["content"]["parts"][0]["text"])
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}: {e.read().decode()[:300]}"
+            print(f"[gemini] attempt {attempt}: {last}")
+            if e.code not in (429, 500, 502, 503, 504):
+                raise
+            if attempt < 4:
+                time.sleep(25)
+        except Exception as e:
+            last = str(e)
+            print(f"[gemini] attempt {attempt}: {last}")
+            if attempt < 4:
+                time.sleep(25)
+    raise RuntimeError(f"Gemini failed after 4 attempts. Last: {last}")
+
+def llm_json(prompt):
+    try:
+        return groq_json(prompt)
+    except Exception as e:
+        print(f"[llm] Groq failed: {e} — trying Gemini backup")
+    return gemini_json(prompt)
 
 def gen_image(prompt, out):
     acct = os.environ["CLOUDFLARE_ACCOUNT_ID"]

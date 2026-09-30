@@ -1,4 +1,4 @@
-"""Faceless series studio. LLM: Groq (curl fallback) + Gemini backup. Images: Cloudflare. Memory: repo folder."""
+"""Faceless series studio v5. Groq (curl fallback) + Gemini backup. Cloudflare images. Series memory."""
 import argparse, base64, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 import requests
@@ -26,47 +26,53 @@ def dur(path):
     return float(out.decode().strip())
 
 DEFAULT_BIBLE = {
-    "character": "a kind middle-aged farmer man, short black hair, tan skin, simple beige tunic, weathered hands",
-    "style": "cinematic photorealistic, warm golden hour light, rich detail, vertical composition, game concept art quality",
-    "negative": "text, watermark, logo, deformed hands, extra limbs, blurry",
+    "character": "a 45-year-old farmer man, weathered olive-tan skin, kind deep-set brown eyes, short black hair with gray at the temples, thick eyebrows, a small scar over his left eyebrow, wearing a patched beige linen tunic and a worn copper amulet on a leather cord, mud-flecked leather boots",
+    "style": "cinematic photorealistic period drama still, shot on 85mm lens, shallow depth of field, volumetric golden-hour light with soft god rays, rich film grain, deep teal and amber color grade, hyper-detailed skin and fabric textures, dramatic composition, prestige TV quality, vertical 9:16 framing",
+    "negative": "text, watermark, logo, deformed hands, extra limbs, blurry, cartoonish, plastic skin",
     "seed": 777123,
 }
 
-WRITER_PROMPT = """You write viral TikTok series episodes in the "life at every level" style.
+WRITER_PROMPT = """You write viral TikTok series episodes in the "life at every level" style — cinematic, emotionally gripping, engineered for watch-time.
 {memory}
 
-CHARACTER (visual consistency — EVERY shot MUST reuse this exact character description):
+CHARACTER (the EXACT string below must be repeated VERBATIM at the start of EVERY single visual, so the face never changes):
 {character}
 
-STYLE (append to every visual): {style}
+STYLE (append to the end of every visual): {style}
 
 Structure: 7 levels (Level 1, 2, 5, 10, 25, 50, 100), each level has EXACTLY 2 shots —
-shot A = arrival (stepping into the stage), shot B = payoff (win, shock, or lesson).
-That is EXACTLY 14 shots. The 14th shot MUST end on a cliffhanger for the next episode.
+shot A = arrival (stepping into the stage), shot B = payoff (a win, a shock, or a lesson).
+That is EXACTLY 14 shots.
+
+EVERY visual must be a rich cinematic painting description: the verbatim character string, plus the emotion on the face, a specific physical action, and at least 3 concrete environment details (objects, weather, crowd, textures). Vary the camera like a director: extreme close-up for emotional beats, wide establishing shot for arrivals, low-angle for power moments, over-the-shoulder for confrontations.
+
+Narration: 17-22 vivid storytelling words per shot, ONE continuous story across all 14. Part 1 must open with a 3-second pattern-interrupt hook (a shocking statement or question), never a slow intro.
+
+ENGAGEMENT ENDING (mandatory): the final shot's narration must end with ONE of these patterns, rotated between episodes: a cliffhanger question the viewer must answer (like: Will the king finally agree? or: Who is really behind the signal?); a next-part promise (like: Part 5 tomorrow — follow so you do not miss what happens); or a comment-bait challenge (like: Comment FORGIVE if you would let her stay).
 
 Return ONLY valid JSON, no markdown:
 {{"title": "<series name + Episode number, <=60 chars>",
   "hook": "<opening narration line, <=15 words>",
   "levels": [
-    {{"label": "Part 1",  "narration": "<17-22 vivid storytelling words>", "visual": "<same character + STARTER environment, arrival>"}},
-    {{"label": "Part 2",  "narration": "...", "visual": "<same character, level 1 payoff>"}},
-    {{"label": "Part 3",  "narration": "...", "visual": "<same character, level 2 arrival>"}},
-    {{"label": "Part 4",  "narration": "...", "visual": "<same character, level 2 payoff>"}},
-    {{"label": "Part 5",  "narration": "...", "visual": "<same character, level 5 arrival>"}},
-    {{"label": "Part 6",  "narration": "...", "visual": "<same character, level 5 payoff>"}},
-    {{"label": "Part 7",  "narration": "...", "visual": "<same character, level 10 arrival>"}},
-    {{"label": "Part 8",  "narration": "...", "visual": "<same character, level 10 payoff>"}},
-    {{"label": "Part 9",  "narration": "...", "visual": "<same character, level 25 arrival>"}},
-    {{"label": "Part 10", "narration": "...", "visual": "<same character, level 25 payoff>"}},
-    {{"label": "Part 11", "narration": "...", "visual": "<same character, level 50 arrival>"}},
-    {{"label": "Part 12", "narration": "...", "visual": "<same character, level 50 payoff>"}},
-    {{"label": "Part 13", "narration": "...", "visual": "<same character, level 100 arrival>"}},
-    {{"label": "Part 14", "narration": "...<ends on cliffhanger>", "visual": "<same character, level 100 payoff + cliffhanger image>"}}
+    {{"label": "Part 1",  "narration": "<17-22 vivid words>", "visual": "<verbatim character string + emotion + action + 3+ environment details + camera angle>"}},
+    {{"label": "Part 2",  "narration": "...", "visual": "..."}},
+    {{"label": "Part 3",  "narration": "...", "visual": "..."}},
+    {{"label": "Part 4",  "narration": "...", "visual": "..."}},
+    {{"label": "Part 5",  "narration": "...", "visual": "..."}},
+    {{"label": "Part 6",  "narration": "...", "visual": "..."}},
+    {{"label": "Part 7",  "narration": "...", "visual": "..."}},
+    {{"label": "Part 8",  "narration": "...", "visual": "..."}},
+    {{"label": "Part 9",  "narration": "...", "visual": "..."}},
+    {{"label": "Part 10", "narration": "...", "visual": "..."}},
+    {{"label": "Part 11", "narration": "...", "visual": "..."}},
+    {{"label": "Part 12", "narration": "...", "visual": "..."}},
+    {{"label": "Part 13", "narration": "...", "visual": "..."}},
+    {{"label": "Part 14", "narration": "...<ends with the engagement hook>", "visual": "<verbatim character string + emotion + action + 3+ details + camera angle + cliffhanger image>"}}
   ],
-  "caption": "<caption <=150 chars>",
-  "hashtags": ["#lifeateverylevel", "#villagelife", "#ai", "#fyp", "#satisfying"],
-  "memory": {{"series_title": "<series name>", "this_episode_recap": "<3-4 sentences: what happened in THIS episode>", "ending_cliffhanger": "<exact cliffhanger the next episode must resolve>"}}}}
-Rules: environment escalates mud hut -> palace/city; visuals always describe the SAME person; the 14 narrations tell ONE continuous story (each continues the last); no real brands or real people."""
+  "caption": "<under 150 chars: bold statement or question + which Part this is + follow CTA>",
+  "hashtags": ["#lifeateverylevel", "#villagelife", "#ai", "#fyp", "<series name as one lowercase word with #>", "<story hashtag>"],
+  "memory": {{"series_title": "<series name>", "this_episode_recap": "<3-4 sentences: what happened in THIS episode>", "ending_cliffhanger": "<exact cliffhanger the next episode must resolve>", "ending_pattern_used": "<which of: cliffhanger question, next-part promise, comment-bait>"}}}}
+Rules: environment escalates mud hut -> palace/city; visuals always describe the SAME person; no real brands or real people."""
 
 def _extract_json(txt):
     txt = txt.strip()
@@ -262,6 +268,9 @@ def cmd_write(ep_id, topic):
                        f"Recap of episode {st['episode_number']}: {st.get('last_recap', '')}\n"
                        f"It ended on this cliffhanger: {st.get('ending_cliffhanger', '')}\n"
                        "Continue the SAME story with the SAME characters. Do NOT start over.")
+        if st.get("last_hook"):
+            memory_text += (f"\nLast episode ended with this hook pattern: {st['last_hook']}. "
+                            "Use a DIFFERENT one of the three patterns this time.")
     else:
         n = 1
         memory_text = ("START A BRAND NEW SERIES (nothing exists yet). Invent a fresh premise, "
@@ -276,7 +285,7 @@ def cmd_write(ep_id, topic):
     for k in ("title", "hook", "caption"):
         data.setdefault(k, "untitled")
     data.setdefault("hashtags", ["#lifeateverylevel", "#ai", "#fyp"])
-    if not isinstance(data.get("levels"), list) or len(data["levels"]) < 10:
+    if not isinstance(data.get("levels"), list) or not (10 <= len(data["levels"]) <= 16):
         raise RuntimeError(f"expected ~14 shots, got {len(data.get('levels', []))}. Keys: {list(data.keys())}")
     for lv in data["levels"]:
         lv.setdefault("label", "Part")
@@ -287,6 +296,7 @@ def cmd_write(ep_id, topic):
            "episode_number": n,
            "last_recap": str(mem.get("this_episode_recap", ""))[:600],
            "ending_cliffhanger": str(mem.get("ending_cliffhanger", ""))[:400],
+           "last_hook": str(mem.get("ending_pattern_used", ""))[:60],
            "finished": n >= MAX_EPISODES}
     (ROOT / "memory").mkdir(exist_ok=True)
     (ROOT / "memory" / "series_state.json").write_text(json.dumps(st2, indent=2, ensure_ascii=False))
@@ -312,7 +322,7 @@ def cmd_produce(ep_id):
         out = auds / f"L{i}.mp3"
         if out.exists() and out.stat().st_size > 1000:
             print(f"[tts] L{i} cached"); continue
-        txt = lv["narration"] if i > 1 else f"{sc['hook']} {lv['narration']}"
+        txt = lv["narration"]
         for attempt in range(1, 4):
             try:
                 sh(["edge-tts", "--voice", VOICE, "--text", txt, "--write-media", out])
@@ -360,7 +370,7 @@ def cmd_produce(ep_id):
 def cmd_notify(ep_id):
     ep = EPS / ep_id
     sc = json.loads((ep / "script.json").read_text())
-    text = f"🎬 {sc['title']}\n\n{sc['caption']}\n\n{' '.join(sc['hashtags'])}\n\nepisode: {ep_id}"
+    text = f"🎬 {sc['title']}\n\n{sc.get('hook', '')}\n\n{sc['caption']}\n\n{' '.join(sc['hashtags'])}\n\nepisode: {ep_id}"
     vid = ep / "video.mp4"
     size_mb = vid.stat().st_size / 1e6
     api = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}"

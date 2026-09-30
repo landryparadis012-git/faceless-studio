@@ -1,5 +1,5 @@
-"""Faceless series studio v6. Groq + Gemini backup. Cloudflare images. Series memory. Limit auto-resume."""
-import argparse, base64, datetime, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
+"""Faceless series studio v7. Groq + Gemini backup. Cloudflare images. Series memory. Limit auto-resume. Burned captions."""
+import argparse, base64, datetime, json, os, random, socket, subprocess, sys, textwrap, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 import requests
 
@@ -377,10 +377,27 @@ def cmd_produce(ep_id):
         a = dur(auds / f"L{i}.mp3")
         frames = int(a * FPS) + FPS
         label = "".join(ch for ch in lv["label"] if ch.isalnum() or ch.isspace()) or f"Part {i}"
+        words = (lv["narration"] or "").split()
+        mid = max(1, (len(words) + 1) // 2)
+        cut = mid
+        for c in range(2, len(words) - 1):
+            if abs(c - mid) < abs(cut - mid) and words[c - 1][-1:] in ",.!?":
+                cut = c
+        capA = segs / f"cap{i}a.txt"
+        capB = segs / f"cap{i}b.txt"
+        capA.write_text(textwrap.fill(" ".join(words[:cut]) or " ", width=22), encoding="utf-8")
+        capB.write_text(textwrap.fill(" ".join(words[cut:]) or " ", width=22), encoding="utf-8")
+        half = a / 2.0
         vf = ("scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,"
               f"zoompan=z='min(zoom+0.0015,1.25)':d={frames}:s=720x1280:fps={FPS},"
-              f"drawtext=text='{label}':fontcolor=white:fontsize=48:box=1:"
-              f"boxcolor=black@0.5:boxborderw=12:x=(w-text_w)/2:y=h-160:fontfile={FONT}")
+              f"drawtext=text='{label}':fontcolor=white:fontsize=34:box=1:"
+              f"boxcolor=black@0.45:boxborderw=10:x=(w-text_w)/2:y=60:fontfile={FONT},"
+              f"drawtext=textfile={capA}:fontfile={FONT}:fontcolor=white:fontsize=46:"
+              f"line_spacing=10:box=1:boxcolor=black@0.55:boxborderw=16:"
+              f"x=(w-text_w)/2:y=h-430:expansion=none:enable='lt(t,{half:.2f})',"
+              f"drawtext=textfile={capB}:fontfile={FONT}:fontcolor=white:fontsize=46:"
+              f"line_spacing=10:box=1:boxcolor=black@0.55:boxborderw=16:"
+              f"x=(w-text_w)/2:y=h-430:expansion=none:enable='gte(t,{half:.2f})'")
         try:
             sh(["ffmpeg", "-y", "-loop", "1", "-i", imgs / f"L{i}.png", "-i", auds / f"L{i}.mp3",
                 "-vf", vf, "-t", f"{a:.2f}", "-r", str(FPS), "-pix_fmt", "yuv420p",

@@ -1,5 +1,5 @@
-"""Faceless 'Life at Every Level' pipeline. LLM: Groq primary (curl fallback), Gemini backup."""
-import argparse, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
+"""Faceless 'Life at Every Level' pipeline. LLM: Groq (curl fallback). Images: Cloudflare Workers AI."""
+import argparse, base64, json, os, random, socket, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 from pathlib import Path
 import requests
 
@@ -9,8 +9,6 @@ EPS = ROOT / "episodes"
 VOICE = "en-US-ChristopherNeural"
 FPS = 30
 FONT = os.environ.get("FONT", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
-IMG_URL = ("https://image.pollinations.ai/prompt/{p}"
-           "?width=720&height=1280&seed={seed}&model=flux&nologo=true")
 GROQ = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_UA = "faceless-studio/1.0"
 GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
@@ -138,51 +136,53 @@ def groq_json(prompt):
                 print(f"[groq] curl {model}: {last}")
     raise RuntimeError(f"Groq failed on all models. Last error: {last}")
 
-def gemini_json(prompt):
-    key = os.environ["GEMINI_API_KEY"]
-    base = "https://generativelanguage.googleapis.com/v1beta"
-    req = urllib.request.Request(f"{base}/models?key={key}&pageSize=100")
-    listing = json.loads(urllib.request.urlopen(req, timeout=60).read())
-    usable = [m["name"].split("/")[-1] for m in listing.get("models", [])
-              if "generateContent" in m.get("supportedGenerationMethods", [])
-              and "flash" in m["name"] and "embedding" not in m["name"]
-              and "image" not in m["name"] and "tts" not in m["name"]
-              and "live" not in m["name"] and "native-audio" not in m["name"]]
-    if not usable:
-        raise RuntimeError(f"No usable Gemini models for this key. Got: {str(listing)[:400]}")
-    model = "gemini-flash-latest" if "gemini-flash-latest" in usable else usable[0]
-    print(f"[gemini] using model: {model}")
-    body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
+def gen_image(prompt, out):
+    acct = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+    key = os.environ["CLOUDFLARE_API_TOKEN"]
+    models = [
+        ("flux", "@cf/black-forest-labs/flux-1-schnell",
+         {"prompt": prompt, "steps": 4}),
+        ("sdxl", "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+         {"prompt": prompt, "width": 576, "height": 1024}),
+    ]
     last = None
-    for attempt in range(1, 5):
-        try:
-            print(f"[gemini] attempt {attempt}/4")
-            req = urllib.request.Request(f"{base}/models/{model}:generateContent?key={key}",
-                data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-            out = json.loads(urllib.request.urlopen(req, timeout=120).read())
-            return _extract_json(out["candidates"][0]["content"]["parts"][0]["text"])
-        except urllib.error.HTTPError as e:
-            last = f"HTTP {e.code}: {e.read().decode()[:300]}"
-            print(f"[gemini] attempt {attempt}: {last}")
-            if e.code not in (429, 500, 502, 503, 504):
-                raise
-            if attempt < 4:
-                time.sleep(25)
-        except Exception as e:
-            last = str(e)
-            print(f"[gemini] attempt {attempt}: {last}")
-            if attempt < 4:
-                time.sleep(25)
-    raise RuntimeError(f"Gemini failed after 4 attempts. Last: {last}")
-
-def llm_json(prompt):
-    if os.environ.get("GROQ_API_KEY"):
-        try:
-            return groq_json(prompt)
-        except Exception as e:
-            print(f"[llm] Groq failed ({str(e)[:200]}) — trying Gemini backup")
-    return gemini_json(prompt)
+    for name, model, body in models:
+        for attempt in range(1, 4):
+            try:
+                print(f"[img] {name} attempt {attempt}/3")
+                req = urllib.request.Request(
+                    f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/{model}",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json",
+                             "Authorization": f"Bearer {key}"})
+                resp = json.loads(urllib.request.urlopen(req, timeout=120).read())
+                if not resp.get("success"):
+                    raise ValueError(f"API error: {str(resp)[:150]}")
+                img_b64 = resp.get("result", {}).get("image")
+                if not img_b64:
+                    raise ValueError(f"no image in response: {str(resp)[:150]}")
+                with open(out, "wb") as f:
+                    f.write(base64.b64decode(img_b64))
+                if out.stat().st_size > 10000:
+                    print(f"[img] OK via {name}")
+                    return
+                raise ValueError("image file too small")
+            except urllib.error.HTTPError as e:
+                last = f"HTTP {e.code}: {e.read().decode()[:120]}"
+                print(f"[img] {name} attempt {attempt}: {last}")
+                if e.code in (401, 402, 403, 404):
+                    break
+                if attempt < 3:
+                    time.sleep(5)
+            except Exception as e:
+                last = str(e)
+                print(f"[img] {name} attempt {attempt}: {last}")
+                if attempt < 3:
+                    time.sleep(5)
+            finally:
+                if out.exists() and out.stat().st_size <= 10000:
+                    out.unlink()
+    raise RuntimeError(f"image generation failed for {out.name}. Last: {last}")
 
 def cmd_write(ep_id, topic):
     ep = EPS / ep_id
@@ -216,23 +216,11 @@ def cmd_produce(ep_id):
         d.mkdir(parents=True, exist_ok=True)
     bible = DEFAULT_BIBLE
     for i, lv in enumerate(sc["levels"], 1):
-        out = imgs / f"L{i}.jpg"
+        out = imgs / f"L{i}.png"
         if out.exists() and out.stat().st_size > 10000:
             print(f"[img] L{i} cached"); continue
         prompt = f"{lv['visual']}, {bible['style']}"
-        url = IMG_URL.format(p=urllib.parse.quote(prompt), seed=bible["seed"] + i)
-        ok = False
-        for attempt in range(1, 6):
-            try:
-                urllib.request.urlretrieve(url, out)
-                if out.stat().st_size > 10000:
-                    ok = True; break
-                print(f"[img] L{i} attempt {attempt}: file too small, retrying")
-            except Exception as e:
-                print(f"[img] L{i} attempt {attempt}: {e}")
-            time.sleep(3)
-        if not ok:
-            raise RuntimeError(f"image L{i} failed after 5 attempts")
+        gen_image(prompt, out)
         print(f"[img] L{i} ok")
     for i, lv in enumerate(sc["levels"], 1):
         out = auds / f"L{i}.mp3"
@@ -263,7 +251,7 @@ def cmd_produce(ep_id):
               f"drawtext=text='{label}':fontcolor=white:fontsize=48:box=1:"
               f"boxcolor=black@0.5:boxborderw=12:x=(w-text_w)/2:y=h-160:fontfile={FONT}")
         try:
-            sh(["ffmpeg", "-y", "-loop", "1", "-i", imgs / f"L{i}.jpg", "-i", auds / f"L{i}.mp3",
+            sh(["ffmpeg", "-y", "-loop", "1", "-i", imgs / f"L{i}.png", "-i", auds / f"L{i}.mp3",
                 "-vf", vf, "-t", f"{a:.2f}", "-r", str(FPS), "-pix_fmt", "yuv420p",
                 "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-shortest", sf])
         except Exception:

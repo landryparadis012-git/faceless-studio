@@ -4,6 +4,8 @@ from pathlib import Path
 import requests
 
 socket.setdefaulttimeout(120)
+import hub
+
 ROOT = Path(__file__).parent
 EPS = ROOT / "episodes"
 VOICE = "en-US-ChristopherNeural"
@@ -34,6 +36,46 @@ DEFAULT_BIBLE = {
     "negative": "text, watermark, logo, deformed hands, extra limbs, blurry, cartoonish, plastic skin",
     "seed": 777123,
 }
+
+# Every NEW series takes the next seed, so two series in a row no longer star the
+# same farmer. Inside a series the character is frozen in memory/series_state.json.
+SERIES_SEEDS = [
+    ("a 12th-century Anatolian logging village", "a family squeezed between a landowner and the tax collector"),
+    ("the Istanbul docks in the 1920s", "a porter forced to choose between smugglers and customs"),
+    ("a family emigrating to Germany in the 1960s", "the child left behind and a promise to return"),
+    ("a gladiator school in ancient Rome", "a slave fighting to buy his own freedom"),
+    ("the Ottoman palace kitchens in the 17th century", "a poisoning accusation and a cook's secret"),
+    ("a Viking fishing village in the north", "a shipwright exiled by a blood feud"),
+    ("Brazilian coffee plantations, 1900s", "a worker family tied to the land by debt"),
+    ("a hunter's cabin in Siberia", "a woman searching for her brother in midwinter"),
+    ("a pyramid construction site in Egypt", "a foreman's son and a plan hidden for years"),
+    ("a 1990s Istanbul shantytown", "a family split over a land deed"),
+    ("a caravan on the Silk Road", "a young merchant bargaining with bandits"),
+    ("a mining town in the 1930s", "a miner joining the rescue crew after a collapse"),
+]
+
+
+def _used_seeds():
+    f = ROOT / "memory" / "used_seeds.json"
+    try:
+        used = json.loads(f.read_text())
+        return used if isinstance(used, list) else []
+    except Exception:
+        return []
+
+
+def _next_seed():
+    used = _used_seeds()
+    idx = len(used) % len(SERIES_SEEDS)
+    era, conflict = SERIES_SEEDS[idx]
+    used.append(idx)
+    (ROOT / "memory").mkdir(exist_ok=True)
+    (ROOT / "memory" / "used_seeds.json").write_text(json.dumps(used))
+    return idx, era, conflict
+
+
+def series_len():
+    return hub.series_length(MAX_EPISODES)
 
 WRITER_PROMPT = """You write viral TikTok series episodes in the "life at every level" style — cinematic, emotionally gripping, engineered for watch-time.
 {memory}
@@ -275,22 +317,43 @@ def cmd_write(ep_id, topic):
         print(f"[write] {out} already exists — skipping (idempotent)")
         return
     st = load_state()
-    if st and not st.get("finished") and st.get("episode_number", 0) < MAX_EPISODES:
+    limit = series_len()
+    if st and hub.trigger_flag("new_series"):
+        print("[write] OpsHub asked for a new series - archiving the current arc")
+        try:
+            (ROOT / "memory" / "series_state.json").replace(ROOT / "memory" / "series_state.prev.json")
+        except OSError:
+            pass
+        st = None
+    fresh = not (st and not st.get("finished") and st.get("episode_number", 0) < limit)
+    era = ""
+    conflict = ""
+    if not fresh:
         n = st["episode_number"] + 1
-        memory_text = (f"CONTINUING SERIES '{st['series_title']}' — Episode {n} of {MAX_EPISODES}.\n"
+        memory_text = (f"CONTINUING SERIES '{st['series_title']}' — Episode {n} of {limit}.\n"
                        f"Recap of episode {st['episode_number']}: {st.get('last_recap', '')}\n"
                        f"It ended on this cliffhanger: {st.get('ending_cliffhanger', '')}\n"
                        "Continue the SAME story with the SAME characters. Do NOT start over.")
         if st.get("last_hook"):
             memory_text += (f"\nLast episode ended with this hook pattern: {st['last_hook']}. "
                             "Use a DIFFERENT one of the three patterns this time.")
+        cast = st.get("character") or DEFAULT_BIBLE["character"]
     else:
         n = 1
+        seed_idx, era, conflict = _next_seed()
+        print(f"[write] new series seed #{seed_idx}: {era}")
+        cast = ("INVENT the character this series follows (the same person in every episode).\n"
+                f"Setting/era: {era}\nCore conflict: {conflict}\n"
+                "Return that character in memory.character as ONE English line (age, face, hair, "
+                "clothing, a distinguishing mark) and repeat that exact line at the start of every visual.")
         memory_text = ("START A BRAND NEW SERIES (nothing exists yet). Invent a fresh premise, "
-                       f"characters and series title. It will run {MAX_EPISODES} episodes, "
+                       f"characters and series title. It will run {limit} episodes, "
                        "so plant seeds for future growth.")
     if topic:
         memory_text += f"\nCreator's brief (follow it): {topic}"
+    bible = dict(DEFAULT_BIBLE)
+    if not fresh and st:
+        bible["character"] = st.get("character") or bible["character"]
     print(f"[write] episode #{n} of series")
     data = None
     last_err = None
@@ -301,8 +364,8 @@ def cmd_write(ep_id, topic):
                 probe += (f"\nIMPORTANT: your previous answer was rejected ({last_err}). "
                           "Return ALL 14 shots AND the complete memory object.")
             data = llm_json(WRITER_PROMPT.format(memory=probe,
-                                                 character=DEFAULT_BIBLE["character"],
-                                                 style=DEFAULT_BIBLE["style"]))
+                                                 character=cast,
+                                                 style=bible["style"]))
             if isinstance(data.get("levels"), list) and 10 <= len(data["levels"]) <= 16:
                 break
             last_err = f"only {len(data.get('levels', []))} shots"
@@ -318,7 +381,7 @@ def cmd_write(ep_id, topic):
     for lv in data["levels"]:
         lv.setdefault("label", "Part")
         lv.setdefault("narration", "")
-        lv.setdefault("visual", DEFAULT_BIBLE["character"])
+        lv.setdefault("visual", bible["character"])
     mem = data.get("memory", {}) if isinstance(data.get("memory"), dict) else {}
     if not mem:
         print("[memory] model omitted the memory object — rebuilding it from the script")
@@ -327,15 +390,19 @@ def cmd_write(ep_id, topic):
                "this_episode_recap": all_narr[:600],
                "ending_cliffhanger": data["levels"][-1]["narration"][:400],
                "ending_pattern_used": ""}
-    st2 = {"series_title": str(mem.get("series_title") or data.get("title") or "Untitled Series")[:120],
+    series = str(mem.get("series_title") or data.get("title") or "Untitled Series")[:120]
+    st2 = {"title": series,               # sync-state reads this field
+           "series_title": series,
            "episode_number": n,
            "last_recap": str(mem.get("this_episode_recap", ""))[:600],
            "ending_cliffhanger": str(mem.get("ending_cliffhanger", ""))[:400],
            "last_hook": str(mem.get("ending_pattern_used", ""))[:60],
-           "finished": n >= MAX_EPISODES}
+           "character": str(mem.get("character") or bible["character"])[:700],
+           "seed": era if fresh else str((st or {}).get("seed", ""))[:200],
+           "finished": n >= limit}
     (ROOT / "memory").mkdir(exist_ok=True)
     (ROOT / "memory" / "series_state.json").write_text(json.dumps(st2, indent=2, ensure_ascii=False))
-    print(f"[memory] episode {n}/{MAX_EPISODES} recorded" + (" — SERIES COMPLETE! next /start = new series" if st2["finished"] else ""))
+    print(f"[memory] episode {n}/{limit} recorded" + (" — SERIES COMPLETE! next /start = new series" if st2["finished"] else ""))
     out.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     print(f"[write] OK -> {out}")
 
@@ -345,7 +412,10 @@ def cmd_produce(ep_id):
     imgs, auds, segs = ep / "images", ep / "audio", ep / "segs"
     for d in (imgs, auds, segs):
         d.mkdir(parents=True, exist_ok=True)
-    bible = DEFAULT_BIBLE
+    bible = dict(DEFAULT_BIBLE)
+    _state = load_state() or {}
+    if _state.get("character"):
+        bible["character"] = _state["character"]
     for i, lv in enumerate(sc["levels"], 1):
         out = imgs / f"L{i}.png"
         if out.exists() and out.stat().st_size > 10000:
@@ -432,6 +502,7 @@ def cmd_notify(ep_id):
         print(f"[notify] {r.status_code} {r.text[:200]}")
         r.raise_for_status()
         print(f"[notify] video is {size_mb:.0f} MB — download it from the run's Artifacts")
+        _emit_ready(sc, ep_id)
         return
     with open(vid, "rb") as f:
         r = requests.post(f"{api}/sendVideo",
@@ -439,6 +510,22 @@ def cmd_notify(ep_id):
                           files={"video": f}, timeout=600)
     print(f"[notify] {r.status_code} {r.text[:200]}")
     r.raise_for_status()
+    _emit_ready(sc, ep_id)
+
+def _emit_ready(sc, ep_id):
+    """Feed OpsHub: one episode_ready event plus the refreshed series state."""
+    st = load_state() or {}
+    series = st.get("series_title") or sc.get("title", "series")
+    ep_no = st.get("episode_number") or 0
+    hub.emit_episode_ready(series_id=series, episode_number=ep_no,
+                           title=sc.get("title", ""), hook_type=st.get("last_hook", ""),
+                           engine_version="v7", episode=ep_id,
+                           shots=len(sc.get("levels", [])), language="en",
+                           seed=st.get("seed", ""))
+    hub.emit_series_state(series_id=series, episode_number=ep_no,
+                          finished=bool(st.get("finished")), max_episodes=series_len(),
+                          title=sc.get("title", ""), last_hook=st.get("last_hook", ""),
+                          engine_version="v7", language="en")
 
 def _tell(text):
     try:
@@ -453,6 +540,10 @@ if __name__ == "__main__":
     p.add_argument("--episode", required=True)
     p.add_argument("--topic")
     a = p.parse_args()
+    if not a.topic:
+        a.topic = hub.trigger_topic()
+    if a.topic:
+        print(f"[pipeline] brief from {hub.why()}: {a.topic}")
     try:
         {"write": lambda: cmd_write(a.episode, a.topic),
          "produce": lambda: cmd_produce(a.episode),
